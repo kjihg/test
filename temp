@@ -1,0 +1,507 @@
+"""
+portfolio_bbg_vcv.py
+
+Compute GBP-based daily returns, correlations, and annualised variance–covariance (VCV)
+for a portfolio of LSE-listed ETFs using Bloomberg (blpapi) via pdblp.
+
+Inputs:
+- positions: dict[str, float] mapping your local symbols (e.g. IBKR symbols) -> shares held
+- optional mapping from local symbol -> Bloomberg security (e.g. "VWRL" -> "VWRL LN Equity")
+
+Features:
+- Fetches each security's trading currency from Bloomberg (CRNCY)
+- Pulls daily prices from Bloomberg (PX_LAST) for the window you choose
+- Pulls FX from Bloomberg to convert everything into GBP before computing returns
+- Produces:
+  - GBP daily return table
+  - Correlation matrix
+  - Annualised variance–covariance matrix (VCV)
+  - Optional rolling correlations/VCV
+  - Portfolio daily returns + simple total return over window (GBP)
+
+Requirements:
+    pip install pdblp pandas numpy
+    Bloomberg Terminal/API access (blpapi) available on the machine
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# --------- Default mapping: IBKR symbol -> Bloomberg ticker ----------
+DEFAULT_BBG_TICKERS: Dict[str, str] = {
+    "XMME": "XMME LN Equity",
+    "EIMI": "EIMI LN Equity",
+    "S7XP": "S7XP LN Equity",
+    "VFEM": "VFEM LN Equity",
+    "VWRL": "VWRL LN Equity",
+    "COPX": "COPX LN Equity",
+    "IGUS": "IGUS LN Equity",
+    "REMX": "REMX LN Equity",
+    "ISPE": "ISPE LN Equity",
+}
+
+
+@dataclass
+class BloombergConfig:
+    host: str = "localhost"
+    port: int = 8194
+    timeout: int = 20000
+
+
+class BloombergClient:
+    """
+    Thin wrapper around pdblp.BCon
+    """
+
+    def __init__(self, config: BloombergConfig):
+        self.config = config
+        self._con = None
+
+    def __enter__(self):
+        import pdblp  # local import to keep module import clean if pdblp isn't installed
+
+        self._con = pdblp.BCon(
+            host=self.config.host,
+            port=self.config.port,
+            timeout=self.config.timeout,
+        )
+        self._con.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._con is not None:
+            try:
+                self._con.stop()
+            except Exception:
+                pass
+        self._con = None
+
+    @property
+    def con(self):
+        if self._con is None:
+            raise RuntimeError("BloombergClient not started. Use within a context manager.")
+        return self._con
+
+    def bdh(self, tickers: List[str], flds: List[str], start: str, end: str) -> pd.DataFrame:
+        """
+        Bloomberg historical data (daily). Returns a DataFrame with MultiIndex columns (ticker, field).
+        """
+        df = self.con.bdh(tickers=tickers, flds=flds, start_date=start, end_date=end)
+        if df is None or df.empty:
+            raise RuntimeError("BDH returned empty data. Check tickers, fields, dates, and Bloomberg connectivity.")
+        return df
+
+    def bdp(self, tickers: List[str], flds: List[str]) -> pd.DataFrame:
+        """
+        Bloomberg point-in-time (reference) data.
+        Returns DataFrame indexed by ticker with columns as fields.
+        """
+        df = self.con.bdp(tickers=tickers, flds=flds)
+        if df is None or df.empty:
+            raise RuntimeError("BDP returned empty data. Check tickers/fields and Bloomberg connectivity.")
+        return df
+
+
+class PortfolioAnalyzer:
+    def __init__(
+        self,
+        bbg_config: BloombergConfig = BloombergConfig(),
+        symbol_to_bbg: Optional[Dict[str, str]] = None,
+        base_ccy: str = "GBP",
+    ):
+        self.bbg_config = bbg_config
+        self.symbol_to_bbg = symbol_to_bbg or DEFAULT_BBG_TICKERS.copy()
+        self.base_ccy = base_ccy.upper()
+
+    # ---------------- Bloomberg fetch helpers ----------------
+
+    def _fetch_security_currencies(self, bbg_tickers: List[str]) -> Dict[str, str]:
+        """
+        Fetch CRNCY for each security.
+        Returns: {bbg_ticker: 'GBP'/'USD'/...}
+        """
+        with BloombergClient(self.bbg_config) as bbg:
+            ref = bbg.bdp(bbg_tickers, ["CRNCY"])
+        # pdblp sometimes returns columns as MultiIndex; normalize
+        if isinstance(ref.columns, pd.MultiIndex):
+            # Expect (field, ) or (ticker, field) depending on pdblp version
+            # Try to find 'CRNCY'
+            if "CRNCY" in ref.columns.get_level_values(-1):
+                crncy = ref.xs("CRNCY", axis=1, level=-1)
+            else:
+                # last resort: flatten and find
+                ref.columns = ["|".join(map(str, c)) for c in ref.columns]
+                crncy = ref[[c for c in ref.columns if c.endswith("CRNCY")]]
+        else:
+            crncy = ref[["CRNCY"]]
+
+        out = {}
+        for t in bbg_tickers:
+            try:
+                val = crncy.loc[t].iloc[0]
+            except Exception:
+                val = np.nan
+            if pd.isna(val):
+                raise RuntimeError(f"Could not fetch CRNCY for {t}.")
+            out[t] = str(val).upper()
+        return out
+
+    @staticmethod
+    def _extract_field_frame(df_bdh: pd.DataFrame, field: str) -> pd.DataFrame:
+        """
+        df_bdh columns are MultiIndex: (ticker, field)
+        returns a DataFrame indexed by date with columns = tickers for the requested field.
+        """
+        if not isinstance(df_bdh.columns, pd.MultiIndex):
+            raise ValueError("Expected MultiIndex columns from BDH: (ticker, field).")
+
+        # pdblp typically uses (ticker, field)
+        # Extract all columns where second level matches field
+        try:
+            out = df_bdh.xs(field, axis=1, level=1)
+        except Exception:
+            # try level=-1 in case structure differs
+            out = df_bdh.xs(field, axis=1, level=-1)
+
+        # Ensure columns are plain tickers
+        out.columns = [str(c) for c in out.columns]
+        return out
+
+    def _fetch_prices(self, bbg_tickers: List[str], start: str, end: str) -> pd.DataFrame:
+        """
+        Fetch PX_LAST for the given date range.
+        """
+        with BloombergClient(self.bbg_config) as bbg:
+            hist = bbg.bdh(bbg_tickers, ["PX_LAST"], start, end)
+        px = self._extract_field_frame(hist, "PX_LAST")
+        px = px.sort_index().dropna(how="all")
+        return px
+
+    # ---------------- FX logic ----------------
+
+    def _build_fx_request_list(self, ccy_set: set) -> Tuple[List[str], Dict[str, Tuple[str, bool]]]:
+        """
+        For each currency != base, we attempt:
+            1) {CCY}{BASE} Curncy (direct quote: 1 CCY in BASE)
+            2) {BASE}{CCY} Curncy (inverse quote: 1 BASE in CCY, then invert)
+
+        Returns:
+            fx_tickers_to_try: list of Bloomberg FX tickers to query
+            mapping: {ccy: (fx_ticker, invert_bool)}  chosen ordering is decided later
+        """
+        base = self.base_ccy
+        fx_candidates = {}
+        fx_tickers = []
+
+        for ccy in sorted(ccy_set):
+            ccy = ccy.upper()
+            if ccy == base:
+                continue
+
+            direct = f"{ccy}{base} Curncy"
+            inv = f"{base}{ccy} Curncy"
+
+            # We'll query both and then select whichever has data
+            fx_candidates[ccy] = ((direct, False), (inv, True))
+            fx_tickers.extend([direct, inv])
+
+        return fx_tickers, fx_candidates
+
+    def _fetch_fx_to_gbp(
+        self,
+        currencies: set,
+        start: str,
+        end: str,
+    ) -> Dict[str, pd.Series]:
+        """
+        Fetch FX series for each currency into base_ccy.
+
+        Returns:
+            {ccy: fx_series} where fx_series is "1 unit of CCY in base_ccy"
+            e.g. for USD and base GBP: fx['USD'] = USDGBP series
+        """
+        base = self.base_ccy
+        fx_tickers_to_try, candidates = self._build_fx_request_list(currencies)
+
+        if not fx_tickers_to_try:
+            return {base: pd.Series(dtype=float)}
+
+        with BloombergClient(self.bbg_config) as bbg:
+            fx_hist = bbg.bdh(fx_tickers_to_try, ["PX_LAST"], start, end)
+
+        fx_px = self._extract_field_frame(fx_hist, "PX_LAST").sort_index()
+
+        fx_series_by_ccy: Dict[str, pd.Series] = {base: pd.Series(1.0, index=fx_px.index)}
+
+        for ccy, (opt1, opt2) in candidates.items():
+            (t1, inv1), (t2, inv2) = opt1, opt2
+
+            s1 = fx_px.get(t1)
+            s2 = fx_px.get(t2)
+
+            s1_ok = s1 is not None and s1.dropna().shape[0] > 0
+            s2_ok = s2 is not None and s2.dropna().shape[0] > 0
+
+            if s1_ok:
+                s = s1.astype(float)
+                if inv1:
+                    s = 1.0 / s
+                fx_series_by_ccy[ccy] = s
+            elif s2_ok:
+                s = s2.astype(float)
+                if inv2:
+                    s = 1.0 / s
+                fx_series_by_ccy[ccy] = s
+            else:
+                raise RuntimeError(
+                    f"Could not fetch FX for {ccy}->{base}. Tried {t1} and {t2}."
+                )
+
+        return fx_series_by_ccy
+
+    # ---------------- Core analytics ----------------
+
+    def compute_gbp_prices_and_returns(
+        self,
+        positions: Dict[str, float],
+        start: str,
+        end: str,
+        symbols: Optional[List[str]] = None,
+    ) -> Dict[str, object]:
+        """
+        Pull Bloomberg prices and FX, convert to GBP prices, and compute daily returns.
+
+        Returns dict with:
+            - bbg_tickers: list
+            - security_currency: {bbg: ccy}
+            - px_local: DataFrame (local currency)
+            - fx_to_gbp: {ccy: Series}
+            - px_gbp: DataFrame (GBP converted)
+            - rets_gbp: DataFrame (daily returns in GBP)
+        """
+        if symbols is None:
+            symbols = list(positions.keys())
+
+        missing = [s for s in symbols if s not in self.symbol_to_bbg]
+        if missing:
+            raise ValueError(f"Missing Bloomberg ticker mapping for symbols: {missing}")
+
+        bbg_tickers = [self.symbol_to_bbg[s] for s in symbols]
+
+        # Fetch currencies & local prices
+        sec_ccy = self._fetch_security_currencies(bbg_tickers)
+        px_local = self._fetch_prices(bbg_tickers, start, end)
+
+        # Align: ensure we only keep tickers we actually got
+        got = [t for t in bbg_tickers if t in px_local.columns]
+        if len(got) != len(bbg_tickers):
+            missing_px = sorted(set(bbg_tickers) - set(got))
+            raise RuntimeError(f"Missing PX_LAST series for: {missing_px}")
+
+        # FX: pull all currencies involved
+        ccy_set = set(sec_ccy.values())
+        fx_map = self._fetch_fx_to_gbp(ccy_set, start, end)
+
+        # Convert prices to GBP: px_gbp[t] = px_local[t] * fx[ccy]
+        # where fx[ccy] is "1 CCY in GBP"
+        px_gbp = pd.DataFrame(index=px_local.index)
+        for t in got:
+            ccy = sec_ccy[t]
+            if ccy == self.base_ccy:
+                fx_series = pd.Series(1.0, index=px_local.index)
+            else:
+                fx_series = fx_map[ccy].reindex(px_local.index)
+
+            # forward-fill FX missing values to match trading-day alignment
+            fx_series = fx_series.ffill()
+            px_gbp[t] = px_local[t].astype(float) * fx_series.astype(float)
+
+        # Daily returns in GBP
+        rets_gbp = px_gbp.pct_change().dropna(how="all")
+
+        return {
+            "bbg_tickers": bbg_tickers,
+            "security_currency": sec_ccy,
+            "px_local": px_local,
+            "fx_to_gbp": fx_map,
+            "px_gbp": px_gbp,
+            "rets_gbp": rets_gbp,
+        }
+
+    @staticmethod
+    def correlation_matrix(returns: pd.DataFrame) -> pd.DataFrame:
+        return returns.corr()
+
+    @staticmethod
+    def covariance_matrix_annualised(returns: pd.DataFrame, annualisation_factor: int = 252) -> pd.DataFrame:
+        return returns.cov() * annualisation_factor
+
+    @staticmethod
+    def rolling_covariance_annualised(
+        returns: pd.DataFrame,
+        window: int = 60,
+        annualisation_factor: int = 252,
+    ) -> Dict[pd.Timestamp, pd.DataFrame]:
+        out = {}
+        returns = returns.dropna(how="all")
+        for dt in returns.index[window:]:
+            sub = returns.loc[:dt].tail(window)
+            out[dt] = sub.cov() * annualisation_factor
+        return out
+
+    @staticmethod
+    def rolling_correlation(
+        returns: pd.DataFrame,
+        window: int = 60,
+    ) -> Dict[pd.Timestamp, pd.DataFrame]:
+        out = {}
+        returns = returns.dropna(how="all")
+        for dt in returns.index[window:]:
+            sub = returns.loc[:dt].tail(window)
+            out[dt] = sub.corr()
+        return out
+
+    def portfolio_daily_returns_gbp(
+        self,
+        positions: Dict[str, float],
+        px_gbp: pd.DataFrame,
+        symbols: Optional[List[str]] = None,
+    ) -> pd.Series:
+        """
+        Compute portfolio daily returns in GBP using holdings quantities (shares).
+        Uses daily GBP market value weights (value-weighted return).
+
+        px_gbp columns are Bloomberg tickers. We map from symbols -> bbg tickers.
+        """
+        if symbols is None:
+            symbols = list(positions.keys())
+
+        bbg_tickers = [self.symbol_to_bbg[s] for s in symbols]
+        missing = [t for t in bbg_tickers if t not in px_gbp.columns]
+        if missing:
+            raise ValueError(f"Missing GBP prices for tickers: {missing}")
+
+        # Compute daily market values per holding
+        mv = pd.DataFrame(index=px_gbp.index)
+        for sym, shares in positions.items():
+            if sym not in self.symbol_to_bbg:
+                continue
+            t = self.symbol_to_bbg[sym]
+            mv[t] = px_gbp[t] * float(shares)
+
+        mv = mv.dropna(how="all")
+        total_mv = mv.sum(axis=1)
+
+        # Portfolio return: sum_i w_i,t-1 * r_i,t (use lagged weights)
+        rets = px_gbp[bbg_tickers].pct_change()
+        w_lag = mv.div(total_mv, axis=0).shift(1)
+
+        port_ret = (w_lag * rets).sum(axis=1)
+        port_ret = port_ret.dropna()
+        return port_ret
+
+    @staticmethod
+    def portfolio_total_return_from_daily(port_rets: pd.Series) -> float:
+        """
+        Total return over the window = (prod(1+r) - 1)
+        """
+        return float((1.0 + port_rets).prod() - 1.0)
+
+    # ---------------- One-shot runner ----------------
+
+    def run_full_analysis(
+        self,
+        positions: Dict[str, float],
+        start: str,
+        end: str,
+        recent_window_days: int = 60,
+        annualisation_factor: int = 252,
+    ) -> Dict[str, object]:
+        """
+        Pulls Bloomberg data, converts to GBP, computes returns, correlation, and VCV
+        over full window and recent window.
+        """
+        data = self.compute_gbp_prices_and_returns(positions, start, end)
+        rets = data["rets_gbp"]
+
+        corr_full = self.correlation_matrix(rets)
+        vcv_full = self.covariance_matrix_annualised(rets, annualisation_factor)
+
+        rets_recent = rets.tail(recent_window_days)
+        corr_recent = self.correlation_matrix(rets_recent)
+        vcv_recent = self.covariance_matrix_annualised(rets_recent, annualisation_factor)
+
+        port_rets = self.portfolio_daily_returns_gbp(positions, data["px_gbp"])
+        port_total = self.portfolio_total_return_from_daily(port_rets)
+
+        return {
+            **data,
+            "corr_full": corr_full,
+            "vcv_full_annualised": vcv_full,
+            "corr_recent": corr_recent,
+            "vcv_recent_annualised": vcv_recent,
+            "portfolio_daily_returns_gbp": port_rets,
+            "portfolio_total_return_over_window": port_total,
+            "recent_window_days": recent_window_days,
+        }
+
+
+# ---------------- Example usage ----------------
+if __name__ == "__main__":
+    # Example positions (replace with your own)
+    positions = {
+        "XMME": 100,
+        "EIMI": 200,
+        "S7XP": 200,
+        "VFEM": 200,
+        "VWRL": 200,
+        "COPX": 1000,
+        "IGUS": 1000,
+        "REMX": 2500,
+        "ISPE": 3000,
+    }
+
+    # Choose a window. Use YYYY-MM-DD.
+    start = "2024-02-01"
+    end = "2026-02-01"
+
+    analyzer = PortfolioAnalyzer(
+        bbg_config=BloombergConfig(host="localhost", port=8194, timeout=20000),
+        symbol_to_bbg=DEFAULT_BBG_TICKERS,
+        base_ccy="GBP",
+    )
+
+    results = analyzer.run_full_analysis(
+        positions=positions,
+        start=start,
+        end=end,
+        recent_window_days=60,
+        annualisation_factor=252,
+    )
+
+    # Print key outputs
+    print("\n=== Security currencies (Bloomberg CRNCY) ===")
+    for t, c in results["security_currency"].items():
+        print(f"{t:20s} {c}")
+
+    print("\n=== Correlation (full window) ===")
+    print(results["corr_full"].round(3))
+
+    print("\n=== Annualised VCV (full window) ===")
+    print(results["vcv_full_annualised"].round(6))
+
+    print("\n=== Correlation (recent window) ===")
+    print(results["corr_recent"].round(3))
+
+    print("\n=== Annualised VCV (recent window) ===")
+    print(results["vcv_recent_annualised"].round(6))
+
+    print("\n=== Portfolio total return over window (GBP) ===")
+    print(f"{results['portfolio_total_return_over_window']:.4%}")
