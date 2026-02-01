@@ -4,20 +4,26 @@ portfolio_bbg_vcv.py
 Compute GBP-based daily returns, correlations, and annualised variance–covariance (VCV)
 for a portfolio of ETFs using Bloomberg via pdblp (blpapi).
 
+Change vs previous version:
+- We NO LONGER fetch currency from Bloomberg (because some ETFs may not return CRNCY reliably).
+- The user supplies the currency for each local symbol (e.g. "VWRL": "GBP").
+- FX is still pulled from Bloomberg to convert prices/returns into GBP (or other base).
+
 Inputs:
-- positions: dict[str, float] mapping your local symbols (e.g. IBKR symbols) -> shares held
-- symbol_to_bbg: dict[str, str] mapping local symbol -> Bloomberg security (e.g. "VWRL" -> "VWRL LN Equity")
+- positions: dict[str, float] mapping local symbols (e.g. IBKR symbols) -> shares held
+- symbol_to_bbg: dict[str, str] mapping local symbol -> Bloomberg security
+- symbol_ccy: dict[str, str] mapping local symbol -> currency code (e.g. "USD", "GBP")
+- base_ccy: base currency (default "GBP")
 
 Features:
-- Fetches each security's currency from Bloomberg using a robust fallback list of fields
 - Pulls daily prices from Bloomberg (PX_LAST)
-- Pulls FX from Bloomberg to convert everything into GBP before computing returns
+- Pulls FX from Bloomberg to convert everything into base currency before computing returns
 - Computes:
-  - GBP daily returns per security
+  - Base-currency daily return table (per security)
   - Correlation matrix
   - Annualised variance–covariance matrix (VCV)
   - Recent-window correlation/VCV
-  - Portfolio daily returns (value-weighted) and total return over window
+  - Portfolio daily returns (value-weighted, using quantities) and total return over window
 
 Requirements:
     pip install pdblp pandas numpy
@@ -33,6 +39,7 @@ import numpy as np
 import pandas as pd
 
 
+# --------- Default mapping: local symbol -> Bloomberg ticker ----------
 DEFAULT_BBG_TICKERS: Dict[str, str] = {
     "XMME": "XMME LN Equity",
     "EIMI": "EIMI LN Equity",
@@ -43,6 +50,20 @@ DEFAULT_BBG_TICKERS: Dict[str, str] = {
     "IGUS": "IGUS LN Equity",
     "REMX": "REMX LN Equity",
     "ISPE": "ISPE LN Equity",
+}
+
+# --------- Example user-supplied currencies (EDIT THESE) ----------
+# IMPORTANT: these should match the pricing currency of PX_LAST for that Bloomberg line.
+EXAMPLE_SYMBOL_CCY: Dict[str, str] = {
+    "XMME": "USD",
+    "EIMI": "USD",
+    "S7XP": "GBP",
+    "VFEM": "GBP",
+    "VWRL": "GBP",
+    "COPX": "USD",
+    "IGUS": "GBP",
+    "REMX": "USD",
+    "ISPE": "GBP",
 }
 
 
@@ -97,81 +118,31 @@ class BloombergClient:
             raise RuntimeError("BDH returned empty data. Check tickers/fields/dates and Bloomberg connectivity.")
         return df
 
-    def ref(self, tickers: List[str], flds: List[str]) -> pd.DataFrame:
-        df = self.con.ref(tickers, flds)
-        if df is None or df.empty:
-            raise RuntimeError("REF returned empty data. Check tickers/fields and Bloomberg connectivity.")
-        return df
-
 
 class PortfolioAnalyzer:
-    # Currency fields to try in order (Bloomberg field mnemonics vary by instrument/type)
-    CURRENCY_FIELDS = ["CRNCY", "CRNCY_TRADING", "TRADE_CRNCY", "PRICE_CURRENCY", "FUND_CRNCY"]
-
     def __init__(
         self,
         bbg_config: BloombergConfig = BloombergConfig(),
         symbol_to_bbg: Optional[Dict[str, str]] = None,
+        symbol_ccy: Optional[Dict[str, str]] = None,
         base_ccy: str = "GBP",
     ):
         self.bbg_config = bbg_config
         self.symbol_to_bbg = symbol_to_bbg or DEFAULT_BBG_TICKERS.copy()
+        self.symbol_ccy = {k: v.upper() for k, v in (symbol_ccy or {}).items()}
         self.base_ccy = base_ccy.upper()
 
     # ---------------- Bloomberg fetch helpers ----------------
 
-    def _fetch_security_currencies(self, bbg_tickers: List[str]) -> Dict[str, str]:
-        """
-        Robustly fetch a currency code for each security using a fallback list of fields.
-        Returns: {bbg_ticker: 'GBP'/'USD'/...}
-        """
-        fields = self.CURRENCY_FIELDS + ["ID_BB_GLOBAL", "SECURITY_DES"]
-        with BloombergClient(self.bbg_config) as bbg:
-            ref = bbg.ref(bbg_tickers, fields)
-
-        out: Dict[str, str] = {}
-
-        # Ensure expected rows exist; if not, give actionable error
-        missing_rows = [t for t in bbg_tickers if t not in ref.index]
-        if missing_rows:
-            raise RuntimeError(
-                "REF did not return rows for some tickers. "
-                f"Missing: {missing_rows}. "
-                "This usually means the Bloomberg ticker isn't resolving on your setup. "
-                "Try confirming the ticker on the Terminal (e.g., 'XMME LN Equity') "
-                "or use an identifier like ISIN with '/ISIN' syntax."
-            )
-
-        for t in bbg_tickers:
-            row = ref.loc[t]
-            ccy_val = None
-            for f in self.CURRENCY_FIELDS:
-                if f in ref.columns:
-                    v = row.get(f, np.nan)
-                    if pd.notna(v) and str(v).strip() != "":
-                        ccy_val = str(v).upper()
-                        break
-
-            if ccy_val is None:
-                bb = row.get("ID_BB_GLOBAL", "")
-                des = row.get("SECURITY_DES", "")
-                raise RuntimeError(
-                    f"Could not determine currency for {t}. "
-                    f"Tried fields {self.CURRENCY_FIELDS}. "
-                    f"Bloomberg resolution info: ID_BB_GLOBAL={bb}, SECURITY_DES={des}. "
-                    "Try using a different currency field or confirm the exact share class/ticker."
-                )
-
-            out[t] = ccy_val
-
-        return out
-
     @staticmethod
     def _extract_field_frame(df_bdh: pd.DataFrame, field: str) -> pd.DataFrame:
+        """
+        df_bdh columns are MultiIndex: (ticker, field) in most pdblp versions.
+        Returns a DataFrame indexed by date with columns = tickers for the requested field.
+        """
         if not isinstance(df_bdh.columns, pd.MultiIndex):
             raise ValueError("Expected MultiIndex columns from BDH: (ticker, field).")
 
-        # pdblp typically: level 0=ticker, level 1=field
         try:
             out = df_bdh.xs(field, axis=1, level=1)
         except Exception:
@@ -191,6 +162,15 @@ class PortfolioAnalyzer:
     def _build_fx_request_list(
         self, ccy_set: set
     ) -> Tuple[List[str], Dict[str, Tuple[Tuple[str, bool], Tuple[str, bool]]]]:
+        """
+        For each currency != base, attempt:
+            1) {CCY}{BASE} Curncy (direct quote: 1 CCY in BASE)
+            2) {BASE}{CCY} Curncy (inverse quote: 1 BASE in CCY, then invert)
+
+        Returns:
+            fx_tickers_to_try: list of Bloomberg FX tickers to query
+            candidates: {ccy: ((direct, invert=False), (inverse, invert=True))}
+        """
         base = self.base_ccy
         candidates = {}
         fx_tickers = []
@@ -258,13 +238,21 @@ class PortfolioAnalyzer:
         if symbols is None:
             symbols = list(positions.keys())
 
-        missing = [s for s in symbols if s not in self.symbol_to_bbg]
-        if missing:
-            raise ValueError(f"Missing Bloomberg ticker mapping for symbols: {missing}")
+        missing_map = [s for s in symbols if s not in self.symbol_to_bbg]
+        if missing_map:
+            raise ValueError(f"Missing Bloomberg ticker mapping for symbols: {missing_map}")
+
+        missing_ccy = [s for s in symbols if s not in self.symbol_ccy]
+        if missing_ccy:
+            raise ValueError(
+                f"Missing currency (symbol_ccy) for symbols: {missing_ccy}. "
+                "Provide the pricing currency for each PX_LAST series."
+            )
 
         bbg_tickers = [self.symbol_to_bbg[s] for s in symbols]
+        sym_to_bbg = {s: self.symbol_to_bbg[s] for s in symbols}
 
-        sec_ccy = self._fetch_security_currencies(bbg_tickers)
+        # Pull prices
         px_local = self._fetch_prices(bbg_tickers, start, end)
 
         got = [t for t in bbg_tickers if t in px_local.columns]
@@ -272,24 +260,34 @@ class PortfolioAnalyzer:
             missing_px = sorted(set(bbg_tickers) - set(got))
             raise RuntimeError(f"Missing PX_LAST series for: {missing_px}")
 
-        ccy_set = set(sec_ccy.values())
+        # FX series (for all non-base currencies)
+        ccy_set = set(self.symbol_ccy[s] for s in symbols)
         fx_map = self._fetch_fx_to_base(ccy_set, start, end)
 
+        # Convert to base currency
         px_base = pd.DataFrame(index=px_local.index)
-        for t in got:
-            ccy = sec_ccy[t]
+        for sym in symbols:
+            t = sym_to_bbg[sym]
+            ccy = self.symbol_ccy[sym].upper()
+
             fx_series = pd.Series(1.0, index=px_local.index) if ccy == self.base_ccy else fx_map[ccy].reindex(px_local.index).ffill()
             px_base[t] = px_local[t].astype(float) * fx_series.astype(float)
 
+        # Daily returns in base currency
         rets_base = px_base.pct_change().dropna(how="all")
+
+        # Also return mapping of bbg_ticker -> currency (from user-supplied)
+        bbg_currency = {sym_to_bbg[sym]: self.symbol_ccy[sym].upper() for sym in symbols}
 
         return {
             "bbg_tickers": bbg_tickers,
-            "security_currency": sec_ccy,
+            "bbg_currency_user": bbg_currency,
             "px_local": px_local,
             "fx_to_base": fx_map,
             "px_base": px_base,
             "rets_base": rets_base,
+            "symbols": symbols,
+            "sym_to_bbg": sym_to_bbg,
         }
 
     @staticmethod
@@ -304,24 +302,19 @@ class PortfolioAnalyzer:
         self,
         positions: Dict[str, float],
         px_base: pd.DataFrame,
-        symbols: Optional[List[str]] = None,
+        symbols: List[str],
+        sym_to_bbg: Dict[str, str],
     ) -> pd.Series:
-        if symbols is None:
-            symbols = list(positions.keys())
-
-        bbg_tickers = [self.symbol_to_bbg[s] for s in symbols]
+        bbg_tickers = [sym_to_bbg[s] for s in symbols]
         missing = [t for t in bbg_tickers if t not in px_base.columns]
         if missing:
             raise ValueError(f"Missing base-currency prices for tickers: {missing}")
 
         mv = pd.DataFrame(index=px_base.index)
-        for sym, shares in positions.items():
-            if sym not in self.symbol_to_bbg:
-                continue
-            t = self.symbol_to_bbg[sym]
-            mv[t] = px_base[t] * float(shares)
+        for sym in symbols:
+            t = sym_to_bbg[sym]
+            mv[t] = px_base[t] * float(positions[sym])
 
-        mv = mv.dropna(how="all")
         total_mv = mv.sum(axis=1)
 
         rets = px_base[bbg_tickers].pct_change()
@@ -351,7 +344,12 @@ class PortfolioAnalyzer:
         corr_recent = self.correlation_matrix(rets_recent)
         vcv_recent = self.covariance_matrix_annualised(rets_recent, annualisation_factor)
 
-        port_rets = self.portfolio_daily_returns_base(positions, data["px_base"])
+        port_rets = self.portfolio_daily_returns_base(
+            positions=positions,
+            px_base=data["px_base"],
+            symbols=data["symbols"],
+            sym_to_bbg=data["sym_to_bbg"],
+        )
         port_total = self.portfolio_total_return_from_daily(port_rets)
 
         return {
@@ -381,12 +379,16 @@ if __name__ == "__main__":
         "ISPE": 3000,
     }
 
+    # Provide the pricing currency for each symbol (PX_LAST currency)
+    symbol_ccy = EXAMPLE_SYMBOL_CCY  # <-- EDIT this to match your lines
+
     start = "2024-02-01"
     end = "2026-02-01"
 
     analyzer = PortfolioAnalyzer(
         bbg_config=BloombergConfig(host="localhost", port=8194, timeout=20000),
         symbol_to_bbg=DEFAULT_BBG_TICKERS,
+        symbol_ccy=symbol_ccy,
         base_ccy="GBP",
     )
 
@@ -401,8 +403,8 @@ if __name__ == "__main__":
     print("\n=== Base currency ===")
     print(results["base_ccy"])
 
-    print("\n=== Security currencies (Bloomberg) ===")
-    for t, c in results["security_currency"].items():
+    print("\n=== User-supplied pricing currency (per Bloomberg line) ===")
+    for t, c in results["bbg_currency_user"].items():
         print(f"{t:20s} {c}")
 
     print("\n=== Correlation (full window) ===")
